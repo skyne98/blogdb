@@ -24,15 +24,12 @@ struct Post {
     description: Option<String>,
 }
 
-// Struct representing an embedded post for the target database
+// Struct representing a chunk of text for embedding
 #[derive(Debug, Serialize)]
-struct EmbeddedPost {
-    id: i32,
-    rss_url: String,
-    title: String,
-    link: String,
-    published: Option<String>,
-    description: Option<String>,
+struct Chunk {
+    article_id: i32,
+    chunk_id: i32,
+    text: String,
     embedding: Vec<f32>,
 }
 
@@ -59,8 +56,8 @@ async fn main() {
 
     let client = Arc::new(client);
 
-    // Define rate limiting: e.g., 5 requests per second
-    let rate_limit = 5;
+    // Define rate limiting: e.g., 100 requests per second
+    let rate_limit = 100;
     let semaphore = Arc::new(Semaphore::new(rate_limit));
 
     // Fetch all posts from the source database
@@ -76,6 +73,12 @@ async fn main() {
         info!("No posts found in source database.");
         return;
     }
+
+    // Ensure unique ids for each post
+    let posts = posts.into_iter().enumerate().map(|(i, mut post)| {
+        post.id = i as i32 + 1;
+        post
+    });
 
     info!("Found {} posts to process.", posts.len());
 
@@ -109,16 +112,27 @@ fn initialize_target_database(db_path: &str) -> SqlResult<()> {
     // Enable Write-Ahead Logging for better concurrency
     conn.execute_batch("PRAGMA journal_mode = WAL;")?;
 
-    // Create the embedded_posts table if it doesn't exist
+    // Create the articles table if it doesn't exist
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS embedded_posts (
+        "CREATE TABLE IF NOT EXISTS articles (
             id INTEGER PRIMARY KEY,
             rss_url TEXT NOT NULL,
             title TEXT NOT NULL,
             link TEXT NOT NULL UNIQUE,
             published TEXT,
-            description TEXT,
-            embedding TEXT NOT NULL
+            description TEXT
+        )",
+        [],
+    )?;
+
+    // Create the chunks table if it doesn't exist
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS article_chunks (
+            chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            article_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            embedding TEXT NOT NULL,
+            FOREIGN KEY(article_id) REFERENCES articles(id)
         )",
         [],
     )?;
@@ -148,13 +162,13 @@ fn fetch_all_posts(db_path: &str) -> SqlResult<Vec<Post>> {
     Ok(posts)
 }
 
-// Function to process a single post: fetch embedding and store in target DB
+// Function to process a single post: split into chunks, fetch embeddings, and store in target DB
 async fn process_post(
     client: &Client,
     target_db_path: &str,
     post: Post,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Extract the description as the content to embed
+    // Extract the description as the content to chunk
     let content = match &post.description {
         Some(desc) => desc.clone(),
         None => {
@@ -162,35 +176,39 @@ async fn process_post(
         }
     };
 
-    // Fetch embedding from Ollama's API
-    let embedding = match get_embedding(client, &content).await {
-        Ok(embed) => embed,
-        Err(e) => {
-            return Err(format!("Failed to get embedding: {}", e).into());
-        }
-    };
+    // Insert the original article into the database
+    insert_article(target_db_path, &post)?;
 
-    // Serialize the embedding as JSON
-    let embedding_json = serde_json::to_string(&embedding)?;
+    // Split the content into chunks of 200 characters or less
+    let chunks = split_into_chunks(&content, 200);
 
-    // Insert into the target database
-    let result = insert_embedded_post(target_db_path, &post, &embedding_json).await;
+    // Process each chunk: fetch embedding and insert into the target DB
+    for (i, chunk_text) in chunks.into_iter().enumerate() {
+        // Fetch embedding from Ollama's API
+        let embedding = match get_embedding(client, &chunk_text).await {
+            Ok(embed) => embed,
+            Err(e) => {
+                return Err(format!("Failed to get embedding: {}", e).into());
+            }
+        };
 
-    match result {
-        Ok(_) => Ok(()),
-        Err(e) => Err(format!("Failed to insert into target DB: {}", e).into()),
+        // Serialize the embedding as JSON
+        let embedding_json = serde_json::to_string(&embedding)?;
+
+        // Insert the chunk into the database
+        insert_chunk(target_db_path, post.id, &chunk_text, &embedding_json).await?;
     }
+
+    Ok(())
 }
 
-// Function to insert an embedded post into the target database
-async fn insert_embedded_post(db_path: &str, post: &Post, embedding_json: &str) -> SqlResult<()> {
-    // Open a new connection for each insertion to ensure thread safety
+// Function to insert an article into the articles table
+fn insert_article(db_path: &str, post: &Post) -> SqlResult<()> {
     let conn = Connection::open(db_path)?;
 
-    // Insert the embedded post
     conn.execute(
-        "INSERT OR IGNORE INTO embedded_posts (id, rss_url, title, link, published, description, embedding) 
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR IGNORE INTO articles (id, rss_url, title, link, published, description) 
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             post.id,
             post.rss_url,
@@ -198,10 +216,35 @@ async fn insert_embedded_post(db_path: &str, post: &Post, embedding_json: &str) 
             post.link,
             post.published,
             post.description,
-            embedding_json,
         ],
     )?;
     Ok(())
+}
+
+// Function to insert a chunk into the chunks table
+async fn insert_chunk(
+    db_path: &str,
+    article_id: i32,
+    text: &str,
+    embedding_json: &str,
+) -> SqlResult<()> {
+    let conn = Connection::open(db_path)?;
+
+    conn.execute(
+        "INSERT INTO article_chunks (article_id, text, embedding) 
+         VALUES (?1, ?2, ?3)",
+        params![article_id, text, embedding_json],
+    )?;
+    Ok(())
+}
+
+// Function to split text into chunks of specified size
+fn split_into_chunks(text: &str, chunk_size: usize) -> Vec<String> {
+    text.chars()
+        .collect::<Vec<_>>()
+        .chunks(chunk_size)
+        .map(|chunk| chunk.iter().collect())
+        .collect()
 }
 
 // Function to get embedding from Ollama's API
@@ -209,29 +252,23 @@ async fn get_embedding(
     client: &Client,
     text: &str,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    // Define the Ollama API endpoint for embeddings
-    let api_url = "http://localhost:11434/v1/embeddings"; // Adjust based on Ollama's API
+    let api_url = "http://localhost:11434/v1/embeddings";
 
-    // Create the request payload
     let payload = json!({
-        "model": "mxbai-embed-large", // Adjust based on the available models in Ollama
+        "model": "mxbai-embed-large",
         "input": text,
     });
 
-    // Send the POST request
     let response = client.post(api_url).json(&payload).send().await?;
 
     if !response.status().is_success() {
         return Err(format!("Ollama API returned status: {}", response.status()).into());
     }
 
-    // Parse the response JSON
     let response_json: serde_json::Value = response.json().await?;
     let response_json = response_json.get("data").ok_or("Invalid response format")?;
     let response_json = response_json.get(0).ok_or("Invalid response format")?;
 
-    // Extract the embedding vector
-    // Adjust based on Ollama's API response structure
     if let Some(embedding) = response_json.get("embedding").and_then(|e| e.as_array()) {
         let vec: Vec<f32> = embedding
             .iter()
