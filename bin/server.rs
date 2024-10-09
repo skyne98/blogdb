@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     error::Error,
+    io::Write,
     sync::{Arc, Mutex},
 };
 use tokio::sync::Semaphore;
@@ -183,7 +184,7 @@ async fn process_query(
 
     // Generate the prompt for the LLM
     let prompt = format!(
-        "You are an AI assistant. Use the following context to answer the question.\n\nContext:\n{}\n\nQuestion: {}\n\nAnswer:",
+        "You are an AI assistant. Use the following context to answer the question.\n\nContext:\n\"\"\"{}\"\"\"\n\nQuestion: \"\"\"{}\"\"\"\n\nAnswer:",
         context, question
     );
 
@@ -301,15 +302,16 @@ async fn get_llm_answer(
     prompt: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Define the Ollama API endpoint for generating completions
-    let api_url = "http://localhost:11434/v1/completions"; // Adjust based on Ollama's API
+    let api_url = "http://localhost:11434/api/generate"; // Adjust based on Ollama's API
 
     // Create the request payload
     let payload = json!({
         "model": "llama3.1:8b", // Adjust based on the available models in Ollama
         "prompt": prompt,
-        "temperature": 1.0,
+        "stream": false,
         "options": {
             "num_ctx": 32 * 1024,
+            "temperature": 1.0,
         }
     });
 
@@ -324,13 +326,8 @@ async fn get_llm_answer(
     let response_json: serde_json::Value = response.json().await?;
 
     // Extract the answer
-    if let Some(answer) = response_json
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("text"))
-        .and_then(|t| t.as_str())
-    {
-        Ok(answer.trim().to_string())
+    if let Some(answer) = response_json.get("response") {
+        Ok(answer.as_str().unwrap().to_string())
     } else {
         Err("Invalid response format from LLM".into())
     }
